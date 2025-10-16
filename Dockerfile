@@ -17,19 +17,13 @@ FROM ghcr.io/astral-sh/uv:python3.13-trixie AS runtime
 RUN curl -fsSL https://github.com/aptible/supercronic/releases/latest/download/supercronic-linux-amd64 -o /usr/local/bin/supercronic \
     && chmod +x /usr/local/bin/supercronic
 
-
-# Opret en ikke-root-bruger
-RUN groupadd -g 1001 appgroup && useradd -u 1001 -g appgroup -m -d /app -s /bin/bash appuser
-
 WORKDIR /app
-COPY --from=build --chown=appuser:appgroup /app .
-
+COPY --from=build /app .
 
 # Kopier cronjob definition
 COPY mailmon-cron /etc/cron.d/mailmon-cron
 RUN chmod 0644 /etc/cron.d/mailmon-cron
 
-USER appuser
 # Start cron i foreground
 CMD ["supercronic", "-debug", "/etc/cron.d/mailmon-cron"]
 
