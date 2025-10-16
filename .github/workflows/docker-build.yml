@@ -1,8 +1,9 @@
 name: Build and push Docker image
 
 on:
+  workflow_dispatch:  # tillad manuel trigger
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   workflow_dispatch:
 
 env:
