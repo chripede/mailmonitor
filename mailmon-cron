@@ -1,0 +1,2 @@
+*/15 * * * * cd /app && uv run main.py 
+
