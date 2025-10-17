@@ -24,10 +24,13 @@ import smtplib
 import ssl
 import imaplib
 from email.message import EmailMessage
+from urllib3.util import Retry
 
 try:
     import dns.resolver
     import requests
+    from requests import Session
+    from requests.adapters import HTTPAdapter
 except Exception as e:
     print("Missing dependency:", e)
     print("Install: pip install dnspython requests")
@@ -73,7 +76,14 @@ def call_webhook(url, payload):
         log.info("No webhook configured for this event (would call with payload: %s)", payload)
         return
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        s = Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.1,
+        )
+        s.mount("http://", HTTPAdapter(max_retries=retries))
+        s.mount("https://", HTTPAdapter(max_retries=retries))
+        r = s.post(url, json=payload, timeout=10)
         log.info("Webhook POST %s -> status %s", url, r.status_code)
     except Exception as e:
         log.error("Failed to call webhook %s: %s", url, e)
