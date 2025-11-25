@@ -205,12 +205,12 @@ def main():
     domain = TO_ADDR.split("@", 1)[1]
     mx_host = resolve_mx_for_domain(domain)
     if not mx_host:
-        call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "mx_lookup_failed"})
+        # call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "mx_lookup_failed"})
         sys.exit(1)
 
     sent = send_direct(mx_host, message_id, token)
     if not sent:
-        call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "smtp_send_failed"})
+        # call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "smtp_send_failed"})
         sys.exit(2)
 
     # Poll IMAP for the message
@@ -220,12 +220,12 @@ def main():
         log.info("Finished: success")
         sys.exit(0)
     elif found is False:
-        call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "not_received"})
+        # call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "not_received"})
         log.info("Finished: not received")
         sys.exit(4)
     else:
         # IMAP error
-        call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "imap_error"})
+        # call_webhook(WEBHOOK_FAIL, {**payload_base, "status": "error", "reason": "imap_error"})
         log.info("Finished: imap error")
         sys.exit(3)
 
