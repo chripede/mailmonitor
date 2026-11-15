@@ -1,2 +1,2 @@
-*/15 * * * * cd /app && uv run main.py 
+*/15 * * * * cd /app && uv run jmap.py 
 
