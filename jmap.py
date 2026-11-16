@@ -3,7 +3,8 @@
 mailflow_monitor.py (JMAP-version, til Stalwart)
 
 - Leverer testmail direkte til MX (port 25) for MON_TO (ingen relay/login).
-- Checker via JMAP (RFC 8620/8621) at mailen dukker op i modtagerkontoen.
+- Checker via JMAP (RFC 8620/8621) at mailen dukker op i modtagerkontoen. Der søges ikke i
+  tekstindekset; de seneste mails hentes og matches på emne/Message-ID i scriptet.
 - Sletter testmailen igen, og rydder gamle testmails op (kan slås fra).
 - Kalder WEBHOOK_OK ved succes og WEBHOOK_FAIL ved fejl (POST JSON).
 - Logger til stdout (INFO level).
@@ -28,8 +29,9 @@ Miljøvariabler:
     MON_SMTP_REQUIRE_TLS    1 = fejl hvis STARTTLS ikke kan forhandles med gyldigt cert (default 0)
     MON_JMAP_MAILBOX        mappe at søge i: rolle ("inbox", "junk", "trash") eller præcist navn
                             ("Junk Mail"). Default: hele kontoen
-    MON_DEBUG               1 = log de 5 seneste mails (tidspunkt, mappe, emne) i kontoen, hvis
-                            testmailen ikke findes (default 1)
+    MON_JMAP_RECENT_LIMIT   hvor mange af de seneste mails der tjekkes pr. poll (default 30)
+    MON_DEBUG               1 = log pr. poll hvad scriptet ser (scan vs. emne-filter), og de 5 seneste
+                            mails i kontoen hvis testmailen ikke findes (default 1). Sæt til 0 i drift
     MON_JMAP_DELETE         1 = slet testmail efter fund + ryd gamle op (default 1)
     MON_JMAP_CLEANUP_AGE    sekunder før en gammel testmail ryddes op (default 3600)
     WEBHOOK_OK, WEBHOOK_FAIL
@@ -88,6 +90,7 @@ JMAP_TOKEN = os.getenv("MON_JMAP_TOKEN")
 JMAP_MAILBOX = os.getenv("MON_JMAP_MAILBOX", "").strip()
 JMAP_DELETE = env_bool("MON_JMAP_DELETE", True)
 CLEANUP_AGE = int(os.getenv("MON_JMAP_CLEANUP_AGE", "3600"))
+RECENT_LIMIT = int(os.getenv("MON_JMAP_RECENT_LIMIT", "30"))
 DEBUG = env_bool("MON_DEBUG", True)  # log seneste mails i kontoen hvis testmailen ikke findes
 
 WEBHOOK_OK = os.getenv("WEBHOOK_OK")
@@ -285,14 +288,40 @@ class Jmap:
             raise MonitorError(EXIT_JMAP, "jmap_mailbox_lookup_failed", str(e))
         raise MonitorError(EXIT_JMAP, "jmap_mailbox_not_found", f"hverken rolle eller navn matcher '{ref}'")
 
-    def _query_and_destroy(self, flt, limit):
-        calls = [["Email/query", {"accountId": self.account, "filter": flt, "limit": limit}, "q"]]
-        if JMAP_DELETE:
-            calls.append(["Email/set", {
+    def recent_emails(self, mailbox_id=None, limit=30, before=None):
+        """Seneste mails sorteret efter modtagelsestidspunkt. Bruger ikke tekstindekset (FTS)."""
+        flt = {}
+        if mailbox_id:
+            flt["inMailbox"] = mailbox_id
+        if before:
+            flt["before"] = before
+        args = {
+            "accountId": self.account,
+            "sort": [{"property": "receivedAt", "isAscending": False}],
+            "limit": limit,
+        }
+        if flt:
+            args["filter"] = flt
+        resp = self.call([
+            ["Email/query", args, "q"],
+            ["Email/get", {
                 "accountId": self.account,
-                "#destroy": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
-            }, "d"])
-        return self.call(calls)
+                "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
+                "properties": ["subject", "messageId", "receivedAt"],
+            }, "g"],
+        ])
+        for cid in ("q", "g"):
+            if resp[cid][0] == "error":
+                raise MonitorError(EXIT_JMAP, "jmap_query_error", str(resp[cid][1]))
+        return resp["g"][1].get("list", [])
+
+    def destroy(self, ids):
+        """Returnerer (ok, svar)."""
+        resp = self.call([["Email/set", {"accountId": self.account, "destroy": list(ids)}, "d"]])
+        name, res, _ = resp["d"]
+        if name == "error":
+            return False, res
+        return not res.get("notDestroyed"), res
 
 
 def dump_recent(jmap, n=5):
@@ -326,48 +355,57 @@ def dump_recent(jmap, n=5):
 
 
 def wait_for_message(jmap, message_id, mailbox_id):
-    """Poller JMAP til testmailen findes. Sletter den i samme request hvis JMAP_DELETE."""
-    by_header = {"header": ["Message-ID", f"<{message_id}@monitor.check>"]}
-    by_subject = {"subject": f"{SUBJECT_PREFIX} {message_id}"}
-    filters = [
-        {"operator": "OR", "conditions": [by_subject, by_header]},  # match på enten emne eller Message-ID
-        by_subject,  # fallback hvis serveren afviser OR/header-filter med unsupportedFilter
-    ]
-    idx = 0
+    """Poller de seneste mails og matcher testmailen i Python (emne eller Message-ID).
+    Sletter den bagefter hvis JMAP_DELETE."""
+    wanted_mid = f"{message_id}@monitor.check"
     errors = 0
     deadline = time.monotonic() + CHECK_TIMEOUT
     log.info("Poller JMAP (timeout %ds, interval %ds)", CHECK_TIMEOUT, POLL_INTERVAL)
 
     while True:
-        flt = filters[idx]
-        if mailbox_id:
-            flt = {"operator": "AND", "conditions": [{"inMailbox": mailbox_id}, flt]}
+        emails = None
         try:
-            resp = jmap._query_and_destroy(flt, 1)
+            emails = jmap.recent_emails(mailbox_id, RECENT_LIMIT)
             errors = 0
         except (requests.RequestException, KeyError, ValueError) as e:
             errors += 1
             log.warning("JMAP-kald fejlede (%d/%d): %s", errors, MAX_POLL_ERRORS, e)
             if errors >= MAX_POLL_ERRORS:
                 raise MonitorError(EXIT_JMAP, "jmap_error", str(e))
-            resp = None
 
-        if resp is not None:
-            name, res, _ = resp["q"]
-            if name == "error":
-                if res.get("type") == "unsupportedFilter" and idx + 1 < len(filters):
-                    log.warning("Serveren understøtter ikke header-filter, skifter til subject-søgning")
-                    idx += 1
-                    continue
-                raise MonitorError(EXIT_JMAP, "jmap_query_error", str(res))
-            if res.get("ids"):
+        if DEBUG and emails is not None:
+            # Sammenlign de to metoder: scan af seneste mails vs. server-side emne-filter (tekstindeks)
+            newest = max((e.get("receivedAt") or "" for e in emails), default="-") or "-"
+            try:
+                r = jmap.call([["Email/query", {
+                    "accountId": jmap.account,
+                    "filter": {"subject": f"{SUBJECT_PREFIX} {message_id}"},
+                    "limit": 1,
+                }, "f"]])
+                if r["f"][0] == "error":
+                    via_filter = "fejl"
+                else:
+                    via_filter = "ja" if r["f"][1].get("ids") else "nej"
+            except Exception:
+                via_filter = "fejl"
+            in_scan = any(
+                wanted_mid in [m.strip("<>") for m in (e.get("messageId") or [])]
+                or message_id in (e.get("subject") or "")
+                for e in emails
+            )
+            log.info("Poll: %d mails set (nyeste modtaget %s) | scan finder testmail: %s | emne-filter finder: %s",
+                     len(emails), newest, "ja" if in_scan else "nej", via_filter)
+
+        for e in emails or []:
+            mids = [m.strip("<>") for m in (e.get("messageId") or [])]
+            if wanted_mid in mids or message_id in (e.get("subject") or ""):
                 log.info("Mail fundet via JMAP")
-                if JMAP_DELETE and "d" in resp:
-                    dname, dres, _ = resp["d"]
-                    if dname == "error" or dres.get("notDestroyed"):
-                        log.warning("Kunne ikke slette testmail: %s", dres)
-                    else:
+                if JMAP_DELETE:
+                    ok, res = jmap.destroy([e["id"]])
+                    if ok:
                         log.info("Testmail slettet")
+                    else:
+                        log.warning("Kunne ikke slette testmail: %s", res)
                 return
 
         if time.monotonic() >= deadline:
@@ -378,17 +416,18 @@ def wait_for_message(jmap, message_id, mailbox_id):
 
 
 def cleanup_old(jmap):
-    """Best effort: slet gamle testmails (fx hvor mailen kom for sent til en tidligere kørsel)."""
+    """Best effort: slet gamle testmails i hele kontoen (fx mails der kom for sent til en tidligere kørsel)."""
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=CLEANUP_AGE)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        resp = jmap._query_and_destroy({"subject": SUBJECT_PREFIX, "before": cutoff}, 100)
-        name, res, _ = resp["q"]
-        if name == "error":
-            log.warning("Oprydning: query fejlede: %s", res)
+        emails = jmap.recent_emails(None, 100, before=cutoff)
+        ids = [e["id"] for e in emails if (e.get("subject") or "").startswith(SUBJECT_PREFIX)]
+        if not ids:
             return
-        n = len(res.get("ids", []))
-        if n:
-            log.info("Oprydning: %d gamle testmail(s) ældre end %ds slettet", n, CLEANUP_AGE)
+        ok, res = jmap.destroy(ids)
+        if ok:
+            log.info("Oprydning: %d gamle testmail(s) ældre end %ds slettet", len(ids), CLEANUP_AGE)
+        else:
+            log.warning("Oprydning: kunne ikke slette alle: %s", res)
     except Exception as e:
         log.warning("Oprydning fejlede (ignoreres): %s", e)
 
