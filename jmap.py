@@ -27,6 +27,15 @@ Miljøvariabler:
     MON_FROM                afsenderadresse (default probe@external-test.local)
     MON_MX_HOST             tving en bestemt MX i stedet for DNS-opslag
     MON_SMTP_REQUIRE_TLS    1 = fejl hvis STARTTLS ikke kan forhandles med gyldigt cert (default 0)
+    Relay-tilstand (aktiveres ved at sætte MON_SMTP_RELAY_HOST; så springes MX-opslag over og mailen
+    indleveres hos relayet, som leverer videre til din MX):
+    MON_SMTP_RELAY_HOST     fx smtp-relay.eksempel.com
+    MON_SMTP_RELAY_PORT     default 587
+    MON_SMTP_RELAY_SECURITY starttls (default for 587) | ssl (default for 465) | none (kun uden login)
+    MON_SMTP_RELAY_USER, MON_SMTP_RELAY_PASS   login til relayet (verificeret TLS er påkrævet)
+    MON_FROM                SKAL sættes i relay-tilstand: en adresse på et domæne, relayet har verificeret,
+                            og som IKKE er det domæne Stalwart modtager for
+    Bemærk: relays omskriver ofte Message-ID. Scriptet matcher derfor også på emnet, som bevares.
     MON_JMAP_MAILBOX        mappe at søge i: rolle ("inbox", "junk", "trash") eller præcist navn
                             ("Junk Mail"). Default: hele kontoen
     MON_JMAP_RECENT_LIMIT   hvor mange af de seneste mails der tjekkes pr. poll (default 30)
@@ -83,6 +92,12 @@ FROM_ADDR = os.getenv("MON_FROM", "probe@external-test.local")
 MX_OVERRIDE = os.getenv("MON_MX_HOST")
 SMTP_REQUIRE_TLS = env_bool("MON_SMTP_REQUIRE_TLS", False)
 
+RELAY_HOST = os.getenv("MON_SMTP_RELAY_HOST", "").strip()
+RELAY_PORT = int(os.getenv("MON_SMTP_RELAY_PORT", "587"))
+RELAY_SECURITY = os.getenv("MON_SMTP_RELAY_SECURITY", "ssl" if RELAY_PORT == 465 else "starttls").strip().lower()
+RELAY_USER = os.getenv("MON_SMTP_RELAY_USER")
+RELAY_PASS = os.getenv("MON_SMTP_RELAY_PASS")
+
 JMAP_URL = os.getenv("MON_JMAP_URL")
 JMAP_USER = os.getenv("MON_JMAP_USER")
 JMAP_PASS = os.getenv("MON_JMAP_PASS")
@@ -97,7 +112,7 @@ WEBHOOK_OK = os.getenv("WEBHOOK_OK")
 WEBHOOK_FAIL = os.getenv("WEBHOOK_FAIL")
 
 SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "30"))
-CHECK_TIMEOUT = int(os.getenv("MON_CHECK_TIMEOUT", "90"))
+CHECK_TIMEOUT = int(os.getenv("MON_CHECK_TIMEOUT", "300" if RELAY_HOST else "90"))  # relay: længere default
 POLL_INTERVAL = int(os.getenv("MON_POLL_INTERVAL", "5"))
 JMAP_TIMEOUT = int(os.getenv("MON_JMAP_TIMEOUT", "15"))
 
@@ -127,6 +142,15 @@ def check_config():
         problems.append("MON_JMAP_URL mangler")
     if not JMAP_TOKEN and not (JMAP_USER and JMAP_PASS):
         problems.append("MON_JMAP_TOKEN eller MON_JMAP_USER + MON_JMAP_PASS mangler")
+    if RELAY_HOST:
+        if not os.getenv("MON_FROM"):
+            problems.append("MON_FROM skal sættes eksplicit i relay-tilstand (afsender på et domæne, relayet har verificeret)")
+        if RELAY_SECURITY not in ("starttls", "ssl", "none"):
+            problems.append("MON_SMTP_RELAY_SECURITY skal være starttls, ssl eller none")
+        if bool(RELAY_USER) != bool(RELAY_PASS):
+            problems.append("MON_SMTP_RELAY_USER og MON_SMTP_RELAY_PASS skal sættes sammen")
+        if RELAY_USER and RELAY_SECURITY == "none":
+            problems.append("Login uden TLS afvises: brug starttls eller ssl sammen med MON_SMTP_RELAY_USER")
     return problems
 
 
@@ -199,7 +223,7 @@ def _smtp_attempt(mx_host, msg, tls_mode):
         smtp.send_message(msg)
 
 
-def send_direct(mx_host, message_id, token):
+def build_message(message_id, token):
     msg = EmailMessage()
     msg["From"] = FROM_ADDR
     msg["To"] = TO_ADDR
@@ -207,6 +231,41 @@ def send_direct(mx_host, message_id, token):
     msg["Message-ID"] = f"<{message_id}@monitor.check>"
     msg["X-Mon-Token"] = token
     msg.set_content(f"Monitor token: {token}\nHost: {socket.gethostname()}")
+    return msg
+
+
+def send_via_relay(message_id, token):
+    """Indlever mailen hos et SMTP-relay (login + verificeret TLS). Relayet leverer videre til MX."""
+    msg = build_message(message_id, token)
+    log.info("Indleverer via relay %s:%d (sikkerhed=%s, login=%s)",
+             RELAY_HOST, RELAY_PORT, RELAY_SECURITY, "ja" if RELAY_USER else "nej")
+    ctx = ssl.create_default_context()
+    try:
+        if RELAY_SECURITY == "ssl":
+            smtp = smtplib.SMTP_SSL(RELAY_HOST, RELAY_PORT, timeout=SMTP_TIMEOUT, context=ctx)
+        else:
+            smtp = smtplib.SMTP(RELAY_HOST, RELAY_PORT, timeout=SMTP_TIMEOUT)
+        with smtp:
+            smtp.ehlo()
+            if RELAY_SECURITY == "starttls":
+                smtp.starttls(context=ctx)
+                smtp.ehlo()
+            if RELAY_USER:
+                smtp.login(RELAY_USER, RELAY_PASS)
+            smtp.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise MonitorError(EXIT_SMTP, "relay_auth_failed", str(e))
+    except (smtplib.SMTPSenderRefused, smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError) as e:
+        raise MonitorError(EXIT_SMTP, "relay_rejected", str(e))
+    except ssl.SSLError as e:
+        raise MonitorError(EXIT_SMTP, "relay_tls_failed", str(e))
+    except (smtplib.SMTPException, OSError) as e:
+        raise MonitorError(EXIT_SMTP, "relay_send_failed", str(e))
+    log.info("Relay har accepteret mailen til videre levering")
+
+
+def send_direct(mx_host, message_id, token):
+    msg = build_message(message_id, token)
 
     modes = ["verify"] if SMTP_REQUIRE_TLS else ["verify", "noverify", "none"]
     last_tls_error = None
@@ -442,7 +501,7 @@ def main():
 
     message_id = uuid.uuid4().hex
     token = uuid.uuid4().hex
-    payload_base = {"id": message_id, "to": TO_ADDR, "from": FROM_ADDR}
+    payload_base = {"id": message_id, "to": TO_ADDR, "from": FROM_ADDR, "mode": "relay" if RELAY_HOST else "direct"}
     jmap = Jmap()
 
     try:
@@ -450,8 +509,11 @@ def main():
         jmap.connect()
         mailbox_id = jmap.mailbox_id(JMAP_MAILBOX) if JMAP_MAILBOX else None
 
-        mx_host = resolve_mx(TO_ADDR.rsplit("@", 1)[1])
-        send_direct(mx_host, message_id, token)
+        if RELAY_HOST:
+            send_via_relay(message_id, token)
+        else:
+            mx_host = resolve_mx(TO_ADDR.rsplit("@", 1)[1])
+            send_direct(mx_host, message_id, token)
         t_sent = time.monotonic()
 
         wait_for_message(jmap, message_id, mailbox_id)
